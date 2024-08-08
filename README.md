@@ -4,6 +4,8 @@
 
 ## Modelo
 
+![image](https://github.com/user-attachments/assets/b65146ce-1bce-4424-906b-bd1b525d7a03)
+
 De base se usa un modelo pre-entrenado del algoritmo de deteccion YOLO (YOLOV5n) para detectar vehiculos y placas.
 Se puede utilizar cualquier modelo de YOLOV5, pero debe asegurarse de convertir el modelo para su Rockchip usando RKNNToolkit.
 
