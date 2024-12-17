@@ -1,7 +1,6 @@
 #ifndef _RKNN_DEMO_PPOCRREC_H_
 #define _RKNN_DEMO_PPOCRREC_H_
 
-#include "opencv2/opencv.hpp"
 #include "rknn/rknn_api.h"
 #include <string.h>
 
@@ -25,11 +24,11 @@ typedef struct ppocr_rec_result
     
 } ppocr_rec_result;
 
-int init_ppocr_rec_model(char* model, rknn_app_context_t* app_ctx, int &model_len, rknn_context &ctx);
+// int init_ppocr_rec_model(char* model, rknn_app_context_t* app_ctx, int &model_len, rknn_context &ctx);
 
-int release_ppocr_rec_model(rknn_app_context_t* app_ctx);
+// int release_ppocr_rec_model(rknn_app_context_t* app_ctx);
 
-int inference_ppocr_rec_model(rknn_app_context_t* app_ctx, void *buf, ppocr_rec_result* out_result);
+// int inference_ppocr_rec_model(rknn_app_context_t* app_ctx, void *buf, ppocr_rec_result* out_result);
 
 int rec_postprocess(float* out_data, int out_channel, int out_seq_len, ppocr_rec_result* text);
 

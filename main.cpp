@@ -1,15 +1,1189 @@
-#include "mainprogram.h"
-#include <QApplication>
-#include <SDL2/SDL.h>
-// undefine main otherwise SDL overrides it.
-#undef main
+/*
+ * ff-rknn - Decode H264 / HEVC, AI Inference, Render it on screen
+ * 2023 Alexander Finger <alex.mobigo@gmail.com>
+ *
+ * This code has been tested on Rockchip RK3588 platform
+ *      kernel v5.10.110 BSP
+ *      ffmpeg 4.4.2 / ffmpeg 5.1 / ffmpeg 6 + SDL3 + RKNN support
+ *
+ * FFMPEG DRM/KMS example application
+ * Jorge Ramirez-Ortiz <jramirez@baylibre.com>
+ *
+ * Main file of the application
+ *      Based on code from:
+ *              2001 Fabrice Bellard (FFMPEG/doc/examples/decode_video.codec_ctx
+ *              2018 Stanimir Varbanov (v4l2-decode/src/drm.codec_ctx)
+ *
+ * This code has been tested on Linaro's Dragonboard 820c
+ *      kernel v4.14.15, venus decoder
+ *      ffmpeg 4.0 + lrusacks ffmpeg/DRM support + review
+ *              https://github.com/ldts/ffmpeg  branch lrusak/v4l2-drmprime
+ *
+ *
+ * Copyright (codec_ctx) 2018 Baylibre
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
+#include "SDL3/SDL.h"
+
+#include <drm_fourcc.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "iostream"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <thread>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavdevice/avdevice.h>
+#include <libavformat/avformat.h>
+#include <libavutil/hwcontext_drm.h>
+#include <libavutil/pixfmt.h>
+}
+
+#include "postprocess.h"
+#include "rknn/rknn_api.h"
+#include <SDL_FontCache.h>
+
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
+#include <opencv4/opencv2/core.hpp>
+#include <opencv4/opencv2/imgcodecs.hpp>
+#include <opencv4/opencv2/opencv.hpp>
+
+#include <rga/RgaUtils.h>
+#include <rga/im2d.h>
+#include <rga/RgaApi.h>
+#include <rga/rga.h>
+
+#define ALIGN(x, a)           ((x) + (a - 1)) & (~(a - 1))
+#define DRM_ALIGN(val, align) ((val + (align - 1)) & ~(align - 1))
+
+#ifndef DRM_FORMAT_NV12_10
+#define DRM_FORMAT_NV12_10 fourcc_code('N', 'A', '1', '2')
+#endif
+
+#ifndef DRM_FORMAT_NV15
+#define DRM_FORMAT_NV15 fourcc_code('N', 'A', '1', '5')
+#endif
+
+#define MODEL_WIDTH  640
+#define MODEL_HEIGHT 640
+#define MODEL_OUT_CHANNEL 6625
+
+#define arg_a 36430 // -a
+#define arg_b 36431 // -b
+#define arg_i 36438 // -i
+#define arg_x 36453 // -x
+#define arg_y 36454 // -y
+#define arg_l 36441 // -l
+#define arg_m 36442 // -m
+#define arg_o 36444 // -o
+#define arg_t 36449 // -t
+#define arg_f 36435 // -f
+#define arg_r 36447 // -r
+#define arg_d 36433 // -d
+#define arg_p 36445 // -p
+#define arg_s 36448 // -s
+
+static unsigned int hash_me(char *str);
+static void rknnInference();
+static unsigned char *load_data(FILE *fp, size_t ofst, size_t sz);
+static unsigned char *load_model(char *filename, int *model_size);
+std::thread rknn_thread;
+
+/* --- RKNN --- */
+int channel = 3;
+int width = MODEL_WIDTH;
+int height = MODEL_HEIGHT;
+unsigned char *model_data;
+int model_data_size = 0;
+char *model;
+char *model_name = NULL;
+float scale_w = 1.0f; // (float)width / img_width;
+float scale_h = 1.0f; // (float)height / img_height;
+detect_result_group_t detect_result_group;
+std::vector<float> out_scales;
+std::vector<int32_t> out_zps;
+rknn_context ctx;
+rknn_input_output_num io_num;
+rknn_input inputs[2];
+rknn_tensor_attr output_attrs[256];
+size_t actual_size = 0;
+const float nms_threshold = NMS_THRESH;
+const float box_conf_threshold = BOX_THRESH;
+char score_result[64];
+cv::Mat src_img;
+im_rect crop_rect;
+
+/* --- SDL --- */
+int alphablend {70};
+int accur;
+unsigned int obj2det;
+int frameSize_texture;
+int frameSize_rknn;
+void *resize_buf;
+void *texture_dst_buf;
+Uint32 format;
+SDL_Texture *texture;
+SDL_Window *window = NULL;
+SDL_Renderer *renderer = NULL;
+FC_Font *font_small {nullptr};
+FC_Font *font_large {nullptr};
+
+int screen_width = 1024;
+int screen_height = 600;
+int screen_left = 0;
+int screen_top = 0;
+unsigned int frame_width = 1920;
+unsigned int frame_height = 1080;
+int v4l2;  // v4l2 h264
+int rtsp;  // rtsp h264
+int rtmp;  // flv h264
+int http;  // flv h264
+int delay; // ms
+char *pixel_format;
+char *sensor_frame_size;
+char *sensor_frame_rate;
+
+float frmrate = 0.0;      // Measured frame rate
+float avg_frmrate = 0.0;  // avg frame rate
+float prev_frmrate = 0.0; // avg frame rate
+Uint32 currtime;
+Uint32 lasttime;
+int loop_counter = 0;
+const int frmrate_update = 25;
+int threadinit {};
+int clientThreadInit {};
+int number_of_cars {};
+
+/* --- Server Socket --- */
+int sock = 0;
+struct sockaddr_in serv_addr;
+
+static void cleanUp(AVFormatContext *input_ctx, AVCodecContext *codec_ctx, AVFrame *frame) {
+
+    if (input_ctx)
+        avformat_close_input(&input_ctx);
+    if (codec_ctx)
+        avcodec_free_context(&codec_ctx);
+    if (frame) {
+        av_frame_free(&frame);
+    }
+    if (texture_dst_buf) {
+        free(texture_dst_buf);
+    }
+    if (resize_buf) {
+        free(resize_buf);
+    }
+    if (renderer) {
+        SDL_DestroyRenderer(renderer);
+    }
+    if (window) {
+        SDL_DestroyWindow(window);
+    }
+
+    SDL_Quit();
+}
+
+int init_client(const char* host, int port) {
+    // Crear el socket
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        std::cerr << "Error al crear el socket" << std::endl;
+        return -1;
+    }
+
+    memset(&serv_addr, '0', sizeof(serv_addr));
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(port);
+
+    // Convertir la dirección IPv4 o IPv6 de texto a formato binario
+    if (inet_pton(AF_INET, host, &serv_addr.sin_addr) <= 0) {
+        std::cerr << "Dirección inválida o no soportada" << std::endl;
+        return -1;
+    }
+
+    // Conectar al servidor
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        std::cerr << "Error al conectar con el servidor" << std::endl;
+        return -1;
+    }
+
+    std::cout << "Conectado al servidor en " << host << ":" << port << std::endl;
+
+    return 0;
+}
+
+void send_data(int &data) {
+    try {
+        while (true) {
+            // Preparar el mensaje para enviar (incluir el identificador del semáforo)
+            std::string message = "semaforo1:" + std::to_string(data);
+
+            // Enviar el número de vehículos al Cliente 1
+            send(sock, message.c_str(), message.length(), 0);
+            std::cout << "[INFO] Enviado número de vehículos para semáforo 1: " << data << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Excepción: " << e.what() << std::endl;
+    }
+
+    // // Cerrar el socket
+    // close(sock);
+}
+
+enum AVPixelFormat get_format(AVCodecContext *Context,
+                              const enum AVPixelFormat *PixFmt)
+{
+    while (*PixFmt != AV_PIX_FMT_NONE) {
+        if (*PixFmt == AV_PIX_FMT_NV12)
+            return AV_PIX_FMT_NV12;
+        PixFmt++;
+    }
+    return AV_PIX_FMT_NONE;
+}
+
+static int drm_rga_buf(int src_Width, int src_Height, int wStride, int hStride, int src_fd,
+                       int src_format, int dst_Width, int dst_Height,
+                       int dst_format, int frameSize, char *buf, char *viraddr)
+{
+    rga_info_t src;
+    rga_info_t dst;
+    int ret;
+    // int hStride = (src_Height + 15) & (~15);
+    // int wStride = (src_Width + 15) & (~15);
+    // int dhStride = (dst_Height + 15) & (~15);
+    // int dwStride = (dst_Width + 15) & (~15);
+
+    memset(&src, 0, sizeof(rga_info_t));
+    src.fd = -1;
+    src.virAddr = viraddr;
+    src.mmuFlag = 1;
+
+    memset(&dst, 0, sizeof(rga_info_t));
+    dst.fd = -1;
+    dst.virAddr = buf;
+    dst.mmuFlag = 1;
+
+    rga_set_rect(&src.rect, 0, 0, src_Width, src_Height, wStride, hStride,
+                 src_format);
+    rga_set_rect(&dst.rect, 0, 0, dst_Width, dst_Height, dst_Width, dst_Height,
+                 dst_format);
+
+    ret = c_RkRgaBlit(&src, &dst, NULL);
+    return ret;
+}
+
+#if 0
+static char *drm_get_rgaformat_str(uint32_t drm_fmt)
+{
+  switch (drm_fmt) {
+  case DRM_FORMAT_NV12:
+    return "RK_FORMAT_YCbCr_420_SP";
+  case DRM_FORMAT_NV12_10:
+    return "RK_FORMAT_YCbCr_420_SP_10B";
+  case DRM_FORMAT_NV15:
+    return "RK_FORMAT_YCbCr_420_SP_10B";
+  case DRM_FORMAT_NV16:
+    return "RK_FORMAT_YCbCr_422_SP";
+  case DRM_FORMAT_YUYV:
+    return "RK_FORMAT_YUYV_422";
+  case DRM_FORMAT_UYVY:
+    return "RK_FORMAT_UYVY_422";
+  default:
+    return "0";
+  }
+}
+#endif
+
+static uint32_t drm_get_rgaformat(uint32_t drm_fmt)
+{
+    switch (drm_fmt) {
+    case DRM_FORMAT_NV12:
+        return RK_FORMAT_YCbCr_420_SP; // NV12 format
+    case DRM_FORMAT_NV12_10:
+        return RK_FORMAT_YCbCr_420_SP_10B; // 10-bit NV12 format
+    case DRM_FORMAT_NV15:
+        return RK_FORMAT_YCbCr_420_SP_10B; // Another 10-bit NV12 variant
+    case DRM_FORMAT_NV16:
+        return RK_FORMAT_YCbCr_422_SP; // 422 format
+    case DRM_FORMAT_YUYV:
+        return RK_FORMAT_YUYV_422; // YUYV format
+    case DRM_FORMAT_UYVY:
+        return RK_FORMAT_UYVY_422; // UYVY format
+    case DRM_FORMAT_YUV420:
+        return RK_FORMAT_YCbCr_420_P; // YUV420 Planar format
+    default:
+        return 0; // Unsupported format
+    }
+}
+
+
+static void rknnInference() {
+
+    int ret {};
+    void *buf = resize_buf;
+
+    while (true) {
+        inputs[0].buf = resize_buf;
+
+        ret = rknn_inputs_set(ctx, io_num.n_input, inputs);
+        rknn_output outputs[io_num.n_output];
+
+        memset(outputs, 0, sizeof(outputs));
+
+        for (int i = 0; i < io_num.n_output; i++) {
+            outputs[i].want_float = 0;
+        }
+
+        ret = rknn_run(ctx, NULL);
+        ret = rknn_outputs_get(ctx, io_num.n_output, outputs, NULL);
+
+        // post process
+        scale_w = (float)width / screen_width;
+        scale_h = (float)height / screen_height;
+
+        for (int i = 0; i < io_num.n_output; ++i) {
+            out_scales.push_back(output_attrs[i].scale);
+            out_zps.push_back(output_attrs[i].zp);
+        }
+
+        post_process((int8_t *)outputs[0].buf, (int8_t *)outputs[1].buf, (int8_t *)outputs[2].buf,
+                     height, width, box_conf_threshold, nms_threshold,
+                     scale_w, scale_h, out_zps, out_scales, &detect_result_group);
+
+        ret = rknn_outputs_release(ctx, io_num.n_output, outputs);
+
+    }
+}
+
+struct BoundingBox {
+    int x, y, w, h;
+    int prev_x, prev_y, prev_w, prev_h;
+    char class_name[512];
+    std::string plate_number {};
+};
+
+std::vector<BoundingBox> bounding_boxes;
+
+float text_alpha = 0.0f;
+bool fade_in = true;
+const float fade_speed = 0.04f;
+
+void displayTexture(void *imageData) {
+    unsigned char *texture_data = NULL;
+    int texture_pitch = 0;
+
+    // SDL_LockTexture(texture, 0, (void **)&texture_data, &texture_pitch);
+    // memcpy(texture_data, (void *)imageData, frameSize_texture);
+    // SDL_UnlockTexture(texture);
+    // SDL_RenderCopy(renderer, texture, NULL, NULL);
+
+    SDL_LockTexture(texture, 0, (void **)&texture_data, &texture_pitch);
+    memcpy(texture_data, (void *)imageData, frameSize_texture);
+    SDL_UnlockTexture(texture);
+    SDL_RenderTexture(renderer, texture, NULL, NULL);
+
+    char text[512];
+    SDL_Rect rect;
+    SDL_Rect rect_bar;
+    SDL_FRect frect;
+    SDL_FRect frect_bar;
+    int accur_obj;
+    int clr;
+    bool detectando = false;
+
+    float alpha = 0.3f;
+
+    std::vector<BoundingBox> current_boxes;
+    std::string detection {};
+    std::vector<std::string> n_cars;
+    number_of_cars = 0;
+
+    for (int i = 0; i < detect_result_group.count; i++) {
+        detect_result_t *det_result = &(detect_result_group.results[i]);
+
+        detection = det_result->name;
+
+        BoundingBox box;
+        box.x = det_result->box.left;
+        box.y = det_result->box.top;
+        box.w = det_result->box.right - det_result->box.left + 1;
+        box.h = det_result->box.bottom - det_result->box.top + 1;
+        sprintf(box.class_name, "%s %.1f%%", det_result->name, det_result->prop * 100);
+
+        if (detection == "Placa") {
+            crop_rect.x = static_cast<int>(box.x * scale_w);
+            crop_rect.y = static_cast<int>(box.y * scale_h);
+            crop_rect.width = static_cast<int>(box.w * scale_w);
+            crop_rect.height = static_cast<int>(box.h * scale_h);
+
+            if (crop_rect.x < 0) crop_rect.x = 0;
+            if (crop_rect.y < 0) crop_rect.y = 0;
+            if (crop_rect.x + crop_rect.width > 640) crop_rect.width = 640 - crop_rect.x;
+            if (crop_rect.y + crop_rect.height > 640) crop_rect.height = 640 - crop_rect.y;
+
+            // if (results.str_size == 6 || results.str_size == 7)
+            //     box.plate_number = results.str;
+        }
+
+        current_boxes.push_back(box);
+
+        detectando = true;
+
+        if (detection == "Vehiculo") {
+            n_cars.push_back(detection);
+            number_of_cars = n_cars.size();
+        }
+    }
+
+    std::vector<BoundingBox> matched_boxes(current_boxes.size());
+
+    for (int i = 0; i < current_boxes.size(); i++) {
+        BoundingBox &current_box = current_boxes[i];
+
+        float min_distance = std::numeric_limits<float>::max();
+        int best_match = -1;
+
+        for (int j = 0; j < bounding_boxes.size(); j++) {
+            BoundingBox &previous_box = bounding_boxes[j];
+
+            float distance = sqrt(pow(current_box.x - previous_box.x, 2) + pow(current_box.y - previous_box.y, 2));
+
+            if (distance < min_distance) {
+                min_distance = distance;
+                best_match = j;
+            }
+        }
+
+        if (best_match != -1 && min_distance < 50) { // Umbral de distancia
+            matched_boxes[i] = bounding_boxes[best_match];
+
+            // Interpolación suave
+            matched_boxes[i].x = alpha * current_box.x + (1 - alpha) * bounding_boxes[best_match].x;
+            matched_boxes[i].y = alpha * current_box.y + (1 - alpha) * bounding_boxes[best_match].y;
+            matched_boxes[i].w = alpha * current_box.w + (1 - alpha) * bounding_boxes[best_match].w;
+            matched_boxes[i].h = alpha * current_box.h + (1 - alpha) * bounding_boxes[best_match].h;
+
+        } else {
+            matched_boxes[i] = current_box; // Sin interpolación
+        }
+
+        // Actualizar los bounding boxes
+        rect.x = matched_boxes[i].x;
+        rect.y = matched_boxes[i].y;
+        rect.w = matched_boxes[i].w;
+        rect.h = matched_boxes[i].h;
+
+        frect.x = matched_boxes[i].x;
+        frect.y = matched_boxes[i].y;
+        frect.w = matched_boxes[i].w;
+        frect.h = matched_boxes[i].h;
+
+        // Dibujar el bounding box
+        if (detect_result_group.results[i].name[0] == 'V' && detect_result_group.results[i].name[1] == 'e')
+            clr = 1;
+        else if (detect_result_group.results[i].name[0] == 'P' && detect_result_group.results[i].name[1] == 'l')
+            clr = 2;
+        else
+            clr = 0;
+
+        if (alphablend) {
+            if (clr == 1)
+                SDL_SetRenderDrawColor(renderer, 0, 0, 255, alphablend);
+            else if (clr == 2)
+                SDL_SetRenderDrawColor(renderer, 51, 153, 255, alphablend);
+            else
+                SDL_SetRenderDrawColor(renderer, 0, 0, 255, alphablend);
+            SDL_RenderFillRect(renderer, &frect);
+        }
+
+        if (clr == 1)
+            SDL_SetRenderDrawColor(renderer, 0, 0, 255, SDL_ALPHA_OPAQUE);
+        else if (clr == 2)
+            SDL_SetRenderDrawColor(renderer, 51, 153, 255, SDL_ALPHA_OPAQUE);
+        else
+            SDL_SetRenderDrawColor(renderer, 0, 0, 255, SDL_ALPHA_OPAQUE);
+        SDL_RenderRect(renderer, &frect);
+
+        rect_bar.x = rect.x;
+        rect_bar.h = 22;
+        rect_bar.w = rect.w;
+        if (rect.w < 80)
+            rect_bar.h += 16;
+        rect_bar.y = rect.y - rect_bar.h;
+        SDL_RenderFillRect(renderer, &frect_bar);
+        rect_bar.y -= 1;
+        if (current_boxes.size() > 0) {
+            FC_DrawBox(font_small, renderer, rect_bar, current_boxes[i].class_name);
+            if (current_boxes[i].class_name == "Placa") {
+                FC_Draw(font_small, renderer, rect_bar.x + 40, rect_bar.y, current_boxes[i].plate_number.c_str(), 30);
+            }
+        }
+    }
+
+    // Actualizar los bounding boxes para el siguiente frame
+    bounding_boxes = matched_boxes;
+
+    // Texto "Detectando..." con fadeIn y fadeOut.
+    if (detectando) {
+        if (fade_in) {
+            text_alpha += fade_speed;
+            if (text_alpha >= 1.0f) {
+                text_alpha = 1.0f;
+                fade_in = false;
+            }
+        } else {
+            text_alpha -= fade_speed;
+            if (text_alpha <= 0.0f) {
+                text_alpha = 0.0f;
+                fade_in = true;
+            }
+        }
+
+        SDL_Color text_color = {255, 255, 255, static_cast<Uint8>(text_alpha * 255)};
+        FC_DrawColor(font_large, renderer, screen_width - 150, screen_height - 50, text_color, "Detectando...");
+    }
+
+    SDL_SetRenderDrawColor(renderer, 120, 120, 120, 115);
+    rect.x = 0;
+    rect.y = 541;
+    rect.w = 240;
+    rect.h = 60;
+    SDL_RenderFillRect(renderer, &frect);
+
+    rect = FC_Draw(font_small, renderer, 20, 548, "VonVision AI");
+    rect.y += rect.h;
+    FC_Draw(font_small, renderer, 20, 563, "Deteccion de Vehiculos y Placas");
+    SDL_RenderPresent(renderer);
+}
+
+static int decode_and_display(AVCodecContext *dec_ctx, AVFrame *frame,
+                              AVPacket *pkt)
+{
+
+    AVDRMFrameDescriptor *desc;
+    AVDRMLayerDescriptor *layer;
+    RgaSURF_FORMAT src_format;
+    int hStride, wStride;
+    int ret;
+
+    ret = avcodec_send_packet(dec_ctx, pkt);
+
+    if (ret < 0) {
+        fprintf(stderr, "Error sending a packet for decoding\n");
+        return ret;
+    }
+
+    ret = 0;
+    while (ret >= 0) {
+
+        ret = avcodec_receive_frame(dec_ctx, frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            break;
+        } else if (ret < 0) {
+            fprintf(stderr, "Error during decoding!\n");
+            return ret;
+        }
+
+        desc = (AVDRMFrameDescriptor *)frame->data[0];
+        layer = &desc->layers[0];
+        if (desc && layer) {
+
+            wStride = frame_width;
+            hStride = frame_height;
+            src_format = (RgaSURF_FORMAT)drm_get_rgaformat(DRM_FORMAT_NV12);
+
+            /* ------------ RKNN ----------- */
+
+            drm_rga_buf(frame->width, frame->height, wStride, hStride, desc->objects[0].fd, src_format,
+                        screen_width, screen_height, RK_FORMAT_BGR_888,
+                        frameSize_texture, (char *)texture_dst_buf, (char *) frame->data[0]);
+
+            drm_rga_buf(frame->width, frame->height, frame->width, frame->height, desc->objects[0].fd, src_format,
+                        width, height, RK_FORMAT_BGR_888,
+                        frameSize_rknn, (char *)resize_buf, (char *) frame->data[0]);
+        }
+
+        if (threadinit == 0) {
+            rknn_thread = std::thread(rknnInference);
+            rknn_thread.detach();
+            threadinit = 1;
+        }
+
+        displayTexture(texture_dst_buf);
+    }
+
+    return 0;
+}
+
+static unsigned int hash_me(char *str)
+{
+    unsigned int hash = 32;
+    while (*str) {
+        hash = ((hash << 5) + hash) + (*str++);
+    }
+    return hash;
+}
+
+void print_help(void)
+{
+    fprintf(stderr, "ff-rknn parameters:\n"
+                    "-x displayed width\n"
+                    "-y displayed height\n"
+                    "-m rknn model\n"
+                    "-f protocol (v4l2, rtsp, rtmp, http)\n"
+                    "-p pixel format (h264) - camera\n"
+                    "-s video frame size (WxH) - camera\n"
+                    "-r video frame rate - camera\n"
+                    "-o unique object to detect\n"
+                    "-b use alpha blend on detected objects (1 ~ 255)\n"
+                    "-a accuracy perc (1 ~ 100)\n");
+}
+
+/*-------------------------------------------
+  Functions
+  -------------------------------------------*/
+static unsigned char *load_data(FILE *fp, size_t ofst, size_t sz)
+{
+    unsigned char *data;
+    int ret;
+
+    data = NULL;
+
+    if (NULL == fp) {
+        return NULL;
+    }
+
+    ret = fseek(fp, ofst, SEEK_SET);
+    if (ret != 0) {
+        fprintf(stderr, "blob seek failure.\n");
+        return NULL;
+    }
+
+    data = (unsigned char *)malloc(sz);
+    if (data == NULL) {
+        fprintf(stderr, "buffer malloc failure.\n");
+        return NULL;
+    }
+    ret = fread(data, 1, sz, fp);
+    return data;
+}
+
+static unsigned char *load_model(char *filename, int *model_size)
+{
+
+    FILE *fp;
+    unsigned char *data;
+
+    if (!filename)
+        return NULL;
+
+    fp = fopen(filename, "rb");
+    if (NULL == fp) {
+        fprintf(stderr, "Open file %s failed.\n", filename);
+        return NULL;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    int size = ftell(fp);
+
+    data = load_data(fp, 0, size);
+
+    fclose(fp);
+
+    *model_size = size;
+    return data;
+}
+
+static int saveFloat(const char *file_name, float *output, int element_size)
+{
+    FILE *fp;
+    fp = fopen(file_name, "w");
+    for (int i = 0; i < element_size; i++) {
+        fprintf(fp, "%.6f\n", output[i]);
+    }
+    fclose(fp);
+    return 0;
+}
 
 int main(int argc, char *argv[])
 {
-    SDL_Init(SDL_INIT_EVERYTHING);
-    QApplication a(argc, argv);
-    MainProgram w;
-    w.setWindowTitle("VonVision AI");
-    w.show();
-    return a.exec();
+    SDL_Event event;
+    SDL_version sdl_compiled;
+    SDL_version sdl_linked;
+    Uint32 wflags = 0 | SDL_WINDOW_FULLSCREEN;
+    AVFormatContext *input_ctx = NULL;
+    AVStream *video = NULL;
+    int video_stream, ret, v4l2 = 0, kmsgrab = 0;
+    AVCodecContext *codec_ctx = NULL;
+    AVCodec *codec;
+    AVFrame *frame;
+    AVPacket pkt;
+    int lindex, opt;
+    char *codec_name = NULL;
+    char *video_name = NULL;
+    char *pixel_format = NULL, *size_window = NULL;
+    AVDictionary *opts = NULL;
+    AVDictionaryEntry *dict = NULL;
+    AVCodecParameters *codecpar;
+    AVInputFormat *ifmt = NULL;
+    int nframe = 1;
+    int finished = 0;
+    int i = 1;
+    unsigned int a;
+
+    a = 0;
+
+    // Creating SDL_Font
+    font_small = FC_CreateFont();
+
+    if (!font_small) {
+        fprintf(stderr, "No small ttf can be created.\n");
+        return -1;
+    }
+
+    font_large = FC_CreateFont();
+
+    if (!font_large) {
+        fprintf(stderr, "No large ttf can be created.\n");
+        return -1;
+    }
+
+    while (i < argc) {
+        a = hash_me(argv[i++]);
+        switch (a) {
+        case arg_i:
+            video_name = argv[i];
+            break;
+        case arg_x:
+            screen_width = atoi(argv[i]);
+            break;
+        case arg_y:
+            screen_height = atoi(argv[i]);
+            break;
+        case arg_l:
+            screen_left = atoi(argv[i]);
+            break;
+        case arg_t:
+            screen_top = atoi(argv[i]);
+            break;
+        case arg_f:
+            // v4l2 = atoi(argv[i]);
+            v4l2 = !strncasecmp(argv[i], "v4l2", 4);
+            rtsp = !strncasecmp(argv[i], "rtsp", 4);
+            rtmp = !strncasecmp(argv[i], "rtmp", 4);
+            http = !strncasecmp(argv[i], "http", 4);
+            break;
+        case arg_r:
+            sensor_frame_rate = argv[i];
+            break;
+        case arg_d:
+            delay = atoi(argv[i]);
+            break;
+        case arg_p:
+            pixel_format = argv[i];
+            break;
+        case arg_s:
+            sensor_frame_size = argv[i];
+            break;
+        case arg_m:
+            model_name = argv[i];
+            break;
+        case arg_o:
+            obj2det = hash_me(argv[i]);
+            break;
+        case arg_b:
+            alphablend = atoi(argv[i]);
+            break;
+        case arg_a:
+            accur = atoi(argv[i]);
+            break;
+        default:
+            break;
+        }
+        i++;
+    }
+    // fprintf(stderr,"%s: %u\n", "-p", hash_me("-p"));
+    // fprintf(stderr,"%s: %u\n", "-s", hash_me("-s"));
+
+    if (!video_name) {
+        fprintf(stderr, "No stream to play! Please pass an input.\n");
+        print_help();
+        return -1;
+    }
+    if (!model_name) {
+        fprintf(stderr, "No model to load! Please pass a model.\n");
+        print_help();
+        return -1;
+    }
+    if (screen_width <= 0)
+        screen_width = 960;
+    if (screen_height <= 0)
+        screen_height = 540;
+    if (screen_left <= 0)
+        screen_left = 0;
+    if (screen_top <= 0)
+        screen_top = 0;
+
+    /* Create the neural network */
+    model_data_size = 0;
+    model_data = load_model(model_name, &model_data_size);
+
+    if (!model_data) {
+        fprintf(stderr, "Error locading model: `%s`\n", model_name);
+        return -1;
+    }
+    fprintf(stderr, "Model: %s - size: %d.\n", model_name, model_data_size);
+    ret = rknn_init(&ctx, model_data, model_data_size, 0, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "rknn_init error ret=%d\n", ret);
+        return -1;
+    }
+
+    rknn_sdk_version version;
+    ret = rknn_query(ctx, RKNN_QUERY_SDK_VERSION, &version,
+                     sizeof(rknn_sdk_version));
+    if (ret < 0) {
+        fprintf(stderr, "rknn_init error ret=%d\n", ret);
+        return -1;
+    }
+    fprintf(stderr, "sdk version: %s driver version: %s\n",
+            version.api_version,
+            version.drv_version);
+
+    ret = rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
+    if (ret < 0) {
+        fprintf(stderr, "rknn_init error ret=%d\n", ret);
+        return -1;
+    }
+    fprintf(stderr, "model input num: %d, output num: %d\n",
+            io_num.n_input,
+            io_num.n_output);
+
+    rknn_tensor_attr input_attrs[io_num.n_input + 1];
+    memset(input_attrs, 0, sizeof(input_attrs));
+    for (int i = 0; i < io_num.n_input; i++) {
+        // fprintf(stderr, "RKNN_QUERY_OUTPUT_ATTR output_attrs[%d].index=%d\n", i, i);
+        input_attrs[i].index = i;
+        ret = rknn_query(ctx, RKNN_QUERY_INPUT_ATTR, &(input_attrs[i]),
+                         sizeof(rknn_tensor_attr));
+        if (ret < 0) {
+            fprintf(stderr, "rknn_init error ret=%d\n", ret);
+            return -1;
+        }
+    }
+
+    memset(output_attrs, 0, sizeof(output_attrs));
+    for (int i = 0; i < io_num.n_output; i++) {
+        output_attrs[i].index = i;
+        ret = rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &(output_attrs[i]),
+                         sizeof(rknn_tensor_attr));
+    }
+
+    if (input_attrs[0].fmt == RKNN_TENSOR_NCHW) {
+        channel = input_attrs[0].dims[1];
+        width = input_attrs[0].dims[2];
+        height = input_attrs[0].dims[3];
+    } else {
+        width = input_attrs[0].dims[1];
+        height = input_attrs[0].dims[2];
+        channel = input_attrs[0].dims[3];
+    }
+
+    fprintf(stderr, "model: %dx%dx%d\n", width, height, channel);
+    memset(inputs, 0, sizeof(inputs));
+    inputs[0].index = 0;
+    inputs[0].type = RKNN_TENSOR_UINT8;
+    inputs[0].size = width * height * channel;
+    inputs[0].fmt = RKNN_TENSOR_NHWC;
+    inputs[0].pass_through = 0;
+
+    memset(&crop_rect, 0, sizeof(crop_rect));
+
+    // im_rect values for RGA_CROP.
+    crop_rect.x = 200;
+    crop_rect.y = 100;
+    crop_rect.width = 320;
+    crop_rect.height = 48;
+
+    input_ctx = avformat_alloc_context();
+    if (!input_ctx) {
+        av_log(0, AV_LOG_ERROR, "Cannot allocate input format (Out of memory?)\n");
+        return -1;
+    }
+
+    av_dict_set(&opts, "num_capture_buffers", "128", 0);
+    if (rtsp) {
+        // av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+        av_dict_set(&opts, "rtsp_flags", "prefer_tcp", 0);
+    }
+    if (v4l2) {
+        avdevice_register_all();
+        ifmt = av_find_input_format("video4linux2");
+        if (!ifmt) {
+            av_log(0, AV_LOG_ERROR, "Cannot find input format: v4l2\n");
+            return -1;
+        }
+        input_ctx->flags |= AVFMT_FLAG_NONBLOCK;
+        if (pixel_format) {
+            av_dict_set(&opts, "input_format", pixel_format, 0);
+        }
+        if (sensor_frame_size)
+            av_dict_set(&opts, "video_size", sensor_frame_size, 0);
+        if (sensor_frame_rate)
+            av_dict_set(&opts, "framerate", sensor_frame_rate, 0);
+    }
+    if (rtmp) {
+        ifmt = av_find_input_format("flv");
+        if (!ifmt) {
+            av_log(0, AV_LOG_ERROR, "Cannot find input format: flv\n");
+            return -1;
+        }
+        av_dict_set(&opts, "fflags", "nobuffer", 0);
+    }
+
+    if (http) {
+        av_dict_set(&opts, "fflags", "nobuffer", 0);
+    }
+
+    if (avformat_open_input(&input_ctx, video_name, ifmt, &opts) != 0) {
+        av_log(0, AV_LOG_ERROR, "Cannot open input file '%s'\n", video_name);
+        avformat_close_input(&input_ctx);
+        return -1;
+    }
+
+    if (avformat_find_stream_info(input_ctx, NULL) < 0) {
+        av_log(0, AV_LOG_ERROR, "Cannot find input stream information.\n");
+        avformat_close_input(&input_ctx);
+        return -1;
+    }
+
+    /* find the video stream information */
+    ret = av_find_best_stream(input_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+    if (ret < 0) {
+        av_log(0, AV_LOG_ERROR, "Cannot find a video stream in the input file\n");
+        avformat_close_input(&input_ctx);
+        return -1;
+    }
+    video_stream = ret;
+
+    /* find the video decoder: ie: h264_rkmpp / h264_rkmpp_decoder */
+    codecpar = input_ctx->streams[video_stream]->codecpar;
+    if (!codecpar) {
+        av_log(0, AV_LOG_ERROR, "Unable to find stream!\n");
+        avformat_close_input(&input_ctx);
+        return -1;
+    }
+
+#if 0
+    if (codecpar->codec_id != AV_CODEC_ID_H264) {
+        av_log(0, AV_LOG_ERROR, "H264 support only!\n");
+        avformat_close_input(&input_ctx);
+        return -1;
+    }
+#endif
+
+    codec = avcodec_find_decoder(codecpar->codec_id);
+    if (!codec) {
+        av_log(0, AV_LOG_ERROR, "Codec not found!\n");
+        avformat_close_input(&input_ctx);
+        return -1;
+    }
+
+    codec_ctx = avcodec_alloc_context3(codec);
+    if (!codec_ctx) {
+        av_log(0, AV_LOG_ERROR, "Could not allocate video codec context!\n");
+        avformat_close_input(&input_ctx);
+        return -1;
+    }
+
+    video = input_ctx->streams[video_stream];
+    if (avcodec_parameters_to_context(codec_ctx, video->codecpar) < 0) {
+        av_log(0, AV_LOG_ERROR, "Error with the codec!\n");
+        avformat_close_input(&input_ctx);
+        avcodec_free_context(&codec_ctx);
+        return -1;
+    }
+
+    codec_ctx->pix_fmt = AV_PIX_FMT_NV12;
+    codec_ctx->coded_height = frame_height;
+    codec_ctx->coded_width = frame_width;
+    codec_ctx->get_format = get_format;
+    codec_ctx->skip_alpha = 1;
+
+#if 0
+    while (dict = av_dict_get(opts, "", dict, AV_DICT_IGNORE_SUFFIX)) {
+        fprintf(stderr, "dict: %s -> %s\n", dict->key, dict->value);
+    }
+#endif
+
+    /* open it */
+    if (avcodec_open2(codec_ctx, codec, &opts) < 0) {
+        av_log(0, AV_LOG_ERROR, "Could not open codec!\n");
+        avformat_close_input(&input_ctx);
+        avcodec_free_context(&codec_ctx);
+        return -1;
+    }
+
+    av_dict_free(&opts);
+
+    frame = av_frame_alloc();
+    if (!frame) {
+        fprintf(stderr, "Could not allocate video frame\n");
+        avformat_close_input(&input_ctx);
+        avcodec_free_context(&codec_ctx);
+        return -1;
+    }
+
+    SDL_VERSION(&sdl_compiled);
+    SDL_GetVersion(&sdl_linked);
+    SDL_Log("SDL: compiled with=%d.%d.%d linked against=%d.%d.%d",
+            sdl_compiled.major, sdl_compiled.minor, sdl_compiled.patch,
+            sdl_linked.major, sdl_linked.minor, sdl_linked.patch);
+
+    // SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengles2");
+    // SDL_SetHint(SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR, "0");
+    if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
+        SDL_Log("SDL_Init failed (%s)", SDL_GetError());
+        avformat_close_input(&input_ctx);
+        avcodec_free_context(&codec_ctx);
+        return -1;
+    }
+
+    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_ACCELERATED_VISUAL, 1);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+
+    window = SDL_CreateWindow("VonVision-AI", screen_width, screen_height, wflags);
+    if (!window) {
+        SDL_Log("SDL_CreateWindowAndRenderer failed (%s)", SDL_GetError());
+        cleanUp(input_ctx, codec_ctx, frame);
+    }
+
+    renderer = SDL_CreateRenderer(window, nullptr, SDL_RENDERER_ACCELERATED);
+    if(renderer == nullptr) {
+        std::cerr << "Can't create renderer: " << SDL_GetError() << std::endl;
+        return -1;
+    }
+
+    if (alphablend) {
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    }
+    // SDL_RenderFillRect(renderer, &rect);
+    SDL_SetWindowTitle(window, "rknn yolov5 object detection");
+    SDL_SetWindowPosition(window, screen_left, screen_top);
+
+    format = SDL_PIXELFORMAT_RGB24;
+    texture = SDL_CreateTexture(renderer, format, SDL_TEXTUREACCESS_STREAMING,
+                                screen_width, screen_height);
+    if (!texture) {
+        av_log(NULL, AV_LOG_FATAL, "Failed to create texturer: %s", SDL_GetError());
+        cleanUp(input_ctx, codec_ctx, frame);
+    }
+
+    frameSize_rknn = width * height * channel;
+    resize_buf = calloc(1, frameSize_rknn);
+
+    frameSize_texture = screen_width * screen_height * channel;
+    texture_dst_buf = calloc(1, frameSize_texture);
+
+    if (!resize_buf || !texture_dst_buf) {
+        av_log(NULL, AV_LOG_FATAL, "Failed to create texture buf: %dx%d",
+               screen_width, screen_height);
+        cleanUp(input_ctx, codec_ctx, frame);
+    }
+
+    if (!FC_LoadFont(font_small, renderer, "/usr/share/fonts/liberation/LiberationMono-Bold.ttf", 14, FC_MakeColor(255, 255, 255, 255), TTF_STYLE_NORMAL))
+        std::cerr << "LOAD FONT_SMALL ERROR" << std::endl;
+    std::cout << "FONT_SMALL LOAD SUCCESS." << std::endl;
+
+    FC_LoadFont(font_large, renderer, "/usr/share/fonts/liberation/LiberationMono-Bold.ttf", 26, FC_MakeColor(255, 255, 255, 155), TTF_STYLE_NORMAL);
+
+    // init_client("10.42.0.1", 9091);
+
+    ret = 0;
+
+    while (ret >= 0) {
+
+        if ((ret = av_read_frame(input_ctx, &pkt)) < 0) {
+            if (ret == AVERROR(EAGAIN)) {
+                ret = 0;
+                continue;
+            }
+            break;
+        }
+        if (video_stream == pkt.stream_index && pkt.size > 0) {
+            ret = decode_and_display(codec_ctx, frame, &pkt);
+        }
+        av_packet_unref(&pkt);
+
+        while (SDL_PollEvent(&event)) {
+            switch (event.type) {
+            case SDL_EVENT_QUIT:
+            {
+                if (threadinit == 1) {
+
+                    // release
+                    if (ctx)
+                        ret = rknn_destroy(ctx);
+
+                    if (model_data) {
+                        free(model_data);
+                    }
+
+                    deinitPostProcess();
+
+                    if (rknn_thread.joinable())
+                        rknn_thread.join();
+                }
+
+                // if (clientThreadInit == 1)
+                //     if (server_client_thread.joinable()) {
+                //         server_client_thread.join();
+                //         // close(sock);
+                //     }
+
+                cleanUp(input_ctx, codec_ctx, frame);
+                SDL_Log("Program quit after %ld ticks", event.quit.timestamp);
+                break;
+            }
+            }
+        }
+        if (finished) {
+            break;
+        }
+    }
+    /* flush the codec */
+    decode_and_display(codec_ctx, frame, NULL);
+    fprintf(stderr, "Avg FPS: %.1f\n", avg_frmrate);
 }
